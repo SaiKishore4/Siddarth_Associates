@@ -1,0 +1,73 @@
+-- analysis.sql
+-- SQLite-compatible schema and example queries for the Sample Data 2 dataset.
+
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    port_code TEXT,
+    date TEXT, -- ISO date (YYYY-MM-DD)
+    iec TEXT,
+    hs_code INTEGER,
+    goods_description TEXT,
+    master_category TEXT,
+    model_name TEXT,
+    model_number TEXT,
+    capacity TEXT,
+    qty INTEGER,
+    unit_of_measure TEXT,
+    price REAL,
+    quantity REAL,
+    unit TEXT,
+    unit_price_inr REAL,
+    total_value_inr REAL,
+    unit_price_usd REAL,
+    total_value_usd REAL,
+    duty_paid_inr REAL
+);
+
+-- Year-wise summary:
+SELECT strftime('%Y', date) AS year,
+       SUM(total_value_inr) AS total_value_inr,
+       SUM(duty_paid_inr) AS duty_paid_inr,
+       SUM(COALESCE(total_value_inr,0) + COALESCE(duty_paid_inr,0)) AS grand_total_inr
+FROM imports
+GROUP BY year
+ORDER BY year;
+
+-- HSN-wise summary with percent contribution:
+WITH hsn_s AS (
+  SELECT hs_code, SUM(COALESCE(total_value_inr,0)) AS total_value_inr, SUM(COALESCE(duty_paid_inr,0)) AS duty_paid_inr,
+         SUM(COALESCE(total_value_inr,0) + COALESCE(duty_paid_inr,0)) AS grand_total_inr
+  FROM imports
+  GROUP BY hs_code
+)
+SELECT hs_code, total_value_inr, duty_paid_inr, grand_total_inr,
+       100.0 * grand_total_inr / (SELECT SUM(grand_total_inr) FROM hsn_s) AS pct_contribution
+FROM hsn_s
+ORDER BY grand_total_inr DESC;
+
+-- Model-level summary:
+SELECT model_name,
+       SUM(qty) AS total_qty,
+       SUM(total_value_inr) AS total_value_inr,
+       AVG(unit_price_usd) AS avg_unit_price_usd,
+       AVG(unit_price_inr) AS avg_unit_price_inr,
+       SUM(duty_paid_inr) AS duty_paid_inr,
+       (CASE WHEN SUM(qty) > 0 THEN SUM(duty_paid_inr)/SUM(qty) ELSE NULL END) AS duty_per_unit
+FROM imports
+GROUP BY model_name
+ORDER BY total_value_inr DESC;
+
+-- Flag rows where duty percent > overall average duty percent
+WITH row_flags AS (
+  SELECT id, total_value_inr, duty_paid_inr,
+         (CASE WHEN total_value_inr > 0 THEN duty_paid_inr/total_value_inr ELSE NULL END) AS duty_pct
+  FROM imports
+),
+avg_duty AS (
+  SELECT AVG(duty_paid_inr/total_value_inr) AS avg_pct FROM imports WHERE total_value_inr > 0
+)
+SELECT r.*, a.avg_pct
+FROM row_flags r, avg_duty a
+WHERE r.duty_pct > a.avg_pct;
