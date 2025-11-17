@@ -1,0 +1,121 @@
+"""analysis.py
+Python script to read 'Sample Data 2.xlsx', parse GOODS DESCRIPTION, create cleaned tables,
+perform summaries and export results to an Excel workbook.
+Dependencies: pandas, openpyxl, xlsxwriter
+Run: python analysis.py
+"""
+
+import re
+import pandas as pd
+from pathlib import Path
+
+INPUT_XLSX = Path("Sample Data 2.xlsx")
+OUTPUT_XLSX = Path("analysis_output.xlsx")
+
+def parse_goods_description(desc):
+    """Extract model, model_no, qty, unit, unit_price_usd using regex heuristics."""
+    if not isinstance(desc, str):
+        return {"model": "", "model_no": "", "qty": None, "unit": "", "unit_price_usd": None}
+    out = {"model":"", "model_no":"", "qty": None, "unit":"", "unit_price_usd": None}
+    # Model: token (up to "MNo:" or "QTY:" or end)
+    m = re.search(r"Model[:\s]*([^MQ\r\n]+?)(?:\sMNo:|\sQTY:|\sQTY\s|$)", desc, flags=re.IGNORECASE)
+    if m:
+        out["model"] = m.group(1).strip()
+    m2 = re.search(r"MNo[:\s]*([^\s,;]+)", desc, flags=re.IGNORECASE)
+    if m2:
+        out["model_no"] = m2.group(1).strip()
+    # QTY: number
+    m3 = re.search(r"QTY[:\s]*([0-9,]+)", desc, flags=re.IGNORECASE)
+    if m3:
+        out["qty"] = int(m3.group(1).replace(",", ""))
+    # Unit: PCS or SET or PKT etc
+    m4 = re.search(r"\b(PCS|SET|PKT|KG|KGS)\b", desc, flags=re.IGNORECASE)
+    if m4:
+        out["unit"] = m4.group(1).upper()
+    # USD price after USD
+    m5 = re.search(r"USD\s*([0-9]*\.?[0-9]+)", desc, flags=re.IGNORECASE)
+    if m5:
+        out["unit_price_usd"] = float(m5.group(1))
+    return out
+
+def load_and_clean(path: Path):
+    df = pd.read_excel(path, sheet_name=0)
+    # Normalize column names
+    df.columns = [c.strip() for c in df.columns]
+    # Parse goods description column
+    if "GOODS DESCRIPTION" not in df.columns:
+        raise ValueError("Input file must have 'GOODS DESCRIPTION' column")
+    parsed = df['GOODS DESCRIPTION'].fillna("").apply(parse_goods_description).apply(pd.Series)
+    df = pd.concat([df, parsed], axis=1)
+    # Ensure numeric columns
+    numeric_cols = ['QUANTITY','Qty','TOTAL VALUE_INR','UNIT PRICE_INR','UNIT PRICE_USD','DUTY PAID_INR']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    # Compute Grand Total
+    if 'TOTAL VALUE_INR' in df.columns and 'DUTY PAID_INR' in df.columns:
+        df['Grand Total_INR'] = df['TOTAL VALUE_INR'].fillna(0) + df['DUTY PAID_INR'].fillna(0)
+    # Derive Year
+    if 'DATE' in df.columns:
+        df['DATE'] = pd.to_datetime(df['DATE'], errors='coerce')
+        df['YEAR'] = df['DATE'].dt.year
+    # Duty percent
+    df['Duty_pct'] = df.apply(lambda r: (r['DUTY PAID_INR'] / r['TOTAL VALUE_INR']) if pd.notna(r.get('DUTY PAID_INR')) and pd.notna(r.get('TOTAL VALUE_INR')) and r['TOTAL VALUE_INR']!=0 else None, axis=1)
+    return df
+
+def create_summaries(df):
+    summaries = {}
+    # Year-wise summary
+    if 'YEAR' in df.columns:
+        yw = df.groupby('YEAR', dropna=True).agg(
+            Total_Value_INR=('TOTAL VALUE_INR','sum'),
+            Duty_Paid_INR=('DUTY PAID_INR','sum'),
+            Grand_Total_INR=('Grand Total_INR','sum')
+        ).reset_index().sort_values('YEAR')
+        yw['YoY_Growth_pct'] = yw['Total_Value_INR'].pct_change() * 100
+        summaries['Year-wise Summary'] = yw
+    # HSN-wise summary
+    if 'HS CODE' in df.columns:
+        hsn = df.groupby('HS CODE', dropna=True).agg(
+            Total_Value_INR=('TOTAL VALUE_INR','sum'),
+            Duty_Paid_INR=('DUTY PAID_INR','sum'),
+            Grand_Total_INR=('Grand Total_INR','sum')
+        ).reset_index().sort_values('Grand_Total_INR', ascending=False)
+        hsn['Pct_Contribution'] = hsn['Grand_Total_INR'] / hsn['Grand_Total_INR'].sum() * 100
+        summaries['HSN-wise Summary'] = hsn
+    # Model-wise summary
+    if 'model' in df.columns:
+        model = df.groupby('model', dropna=True).agg(
+            Total_Qty=('qty','sum'),
+            Total_Value_INR=('TOTAL VALUE_INR','sum'),
+            Avg_Unit_Price_USD=('unit_price_usd','mean'),
+            Avg_Unit_Price_INR=('UNIT PRICE_INR','mean'),
+            Duty_Paid_INR=('DUTY PAID_INR','sum')
+        ).reset_index().sort_values('Total_Value_INR', ascending=False)
+        model['Duty_per_unit'] = model.apply(lambda r: (r['Duty_Paid_INR']/r['Total_Qty']) if r['Total_Qty'] and r['Total_Qty']>0 else None, axis=1)
+        model['Pct_of_Total_Value'] = model['Total_Value_INR'] / model['Total_Value_INR'].sum() * 100
+        summaries['Model & Supplier Analysis'] = model
+    return summaries
+
+def export_to_excel(df, summaries, out_path: Path):
+    with pd.ExcelWriter(out_path, engine='xlsxwriter', datetime_format='yyyy-mm-dd') as writer:
+        df.to_excel(writer, sheet_name='Raw Data', index=False)
+        # Cleaned Data subset
+        cols = ['DATE','YEAR','PORT CODE','IEC','HS CODE','GOODS DESCRIPTION','model','model_no','qty','unit','unit_price_usd','QUANTITY','UNIT PRICE_INR','TOTAL VALUE_INR','DUTY PAID_INR','Grand Total_INR','Duty_pct']
+        present = [c for c in cols if c in df.columns]
+        df[present].to_excel(writer, sheet_name='Cleaned Data', index=False)
+        for name, s in summaries.items():
+            s.to_excel(writer, sheet_name=name, index=False)
+    print(f"Exported to {out_path}")
+
+def main():
+    if not INPUT_XLSX.exists():
+        print(f"Input {INPUT_XLSX} not found. Place 'Sample Data 2.xlsx' in the same folder as this script.")
+        return
+    df = load_and_clean(INPUT_XLSX)
+    summaries = create_summaries(df)
+    export_to_excel(df, summaries, OUTPUT_XLSX)
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
